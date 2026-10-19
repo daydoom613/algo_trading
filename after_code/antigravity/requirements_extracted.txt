@@ -1,0 +1,745 @@
+Total paragraphs: 229
+--- Paragraph 0 ---
+Engineering a Fault-Tolerant Deep Learning Infrastructure for Algorithmic Trading
+---------------------
+--- Paragraph 1 ---
+Design, Implementation, and Validation of a Resilient Signal Generator
+---------------------
+--- Paragraph 2 ---
+Executive Summary
+---------------------
+--- Paragraph 3 ---
+The deployment of deep learning models in financial markets represents a convergence of high-performance computing, statistical signal processing, and quantitative finance. This report addresses a specific, rigorous engineering challenge: the construction of a fault-tolerant machine learning pipeline designed to train on financial time-series data spanning the years 2015 through 2023, with subsequent out-of-sample validation performed on 2024 market data. The core objective is to synthesize a signal generator capable of classifying market states into discrete executable actions—Buy, Sell, or Hold—and to rigorously quantify the correctness of these signals against realized price movements.
+---------------------
+--- Paragraph 4 ---
+A critical constraint in training deep neural networks on high-frequency or extensive historical datasets is the computational stability of the training process. Long-horizon training sessions are susceptible to hardware interruptions, memory overflows, or process termination. Consequently, this architecture mandates a "crash-proof" training resilience. We detail the implementation of a sophisticated checkpointing system using TensorFlow and Keras, ensuring that training can resume seamlessly from the exact state of interruption, preserving both model weights and optimizer momentum.
+---------------------
+--- Paragraph 5 ---
+This document serves as an exhaustive implementation guide. It traverses the entire lifecycle of the algorithmic trading model: from the complex acquisition of historical data via yfinance and supplementary repositories to overcome API limitations; through the precise engineering of predictive features and label generation free of lookahead bias; to the architectural design of Recurrent Neural Networks (RNNs) specifically Long Short-Term Memory (LSTM) units. The analysis concludes with a comprehensive backtesting framework to quantify the "correctness" of the model’s predictions using 2024 data, utilizing confusion matrices and directional accuracy metrics to provide a granular audit of model performance.
+---------------------
+--- Paragraph 6 ---
+1. The Data Ecosystem: Acquisition and Integrity
+---------------------
+--- Paragraph 7 ---
+The validity of any quantitative model is strictly bounded by the quality and granularity of its input data. For the proposed objective, the requirement is a contiguous, high-fidelity dataset spanning from January 1, 2015, to December 31, 2023, for training, and the complete calendar year of 2024 for testing.
+---------------------
+--- Paragraph 8 ---
+1.1 The Challenge of Historical Granularity
+---------------------
+--- Paragraph 9 ---
+The Python library yfinance serves as a primary gateway for accessing historical market data from Yahoo Finance. It offers a standardized Application Programming Interface (API) to retrieve Open, High, Low, Close, and Volume (OHLCV) data.1 However, for a dataset spanning nine years (2015–2023), one must navigate significant architectural limitations inherent to the Yahoo Finance backend, particularly regarding temporal resolution.
+---------------------
+--- Paragraph 10 ---
+1.1.1 Daily vs. Intraday Limitations
+---------------------
+--- Paragraph 11 ---
+If the strategy is designed for a Daily timeframe (one data point per trading day), yfinance is an optimal tool. The period="max" or specific start/end dates can retrieve decades of daily history without restriction.2 This resolution captures broad market trends but misses the microstructure of intraday volatility.
+---------------------
+--- Paragraph 12 ---
+However, many modern algorithmic strategies require Intraday resolution (e.g., 5-minute or 1-hour bars) to capture granular entry and exit points. Here, yfinance enforces strict data retention policies:
+---------------------
+--- Paragraph 13 ---
+1-Minute Data: Retrievable only for the last 7 days.3
+---------------------
+--- Paragraph 14 ---
+Intraday Data (5m to 1h): Retrievable only for the last 60 days.2
+---------------------
+--- Paragraph 15 ---
+This presents a critical critical bottleneck: It is impossible to download intraday data from 2015 to 2023 using standard yfinance calls.5 A request for interval="5m" with a start date in 2015 will return an empty DataFrame or an API error.
+---------------------
+--- Paragraph 16 ---
+1.1.2 Hybrid Data Sourcing Strategy
+---------------------
+--- Paragraph 17 ---
+To satisfy the requirement of training on 2015–2023 data while potentially utilizing intraday signals, we must adopt a Hybrid Sourcing Strategy. This involves fusing data from static archival repositories for the training set with dynamic API fetches for the recent test set.
+---------------------
+--- Paragraph 18 ---
+Archival Data (Training Set: 2015–2023):
+---------------------
+--- Paragraph 19 ---
+For the training period, we must rely on third-party aggregators or dataset repositories that have archived minute-level data. Platforms such as Kaggle host high-quality, community-maintained datasets (e.g., Nifty 50 or SPY minute data) that cover the 2015–2023 epoch.6 These datasets are typically provided in CSV format, containing millions of rows of minute-level OHLCV data.
+---------------------
+--- Paragraph 20 ---
+Live/Recent Data (Test Set: 2024):
+---------------------
+--- Paragraph 21 ---
+For the 2024 validation period, yfinance becomes viable again, provided the data is downloaded in rolling windows or if the resolution is daily. For 5-minute data covering the entirety of 2024, one might still face the 60-day limit if accessing it late in the year. Thus, continuous data collection or premium data providers (like Polygon.io or dedicated broker APIs) are often necessary for professional-grade intraday testing.7
+---------------------
+--- Paragraph 22 ---
+For the purposes of this report, we will proceed with a flexible data ingestion pipeline designed to handle either resolution, assuming the user has secured the 2015–2023 CSV files if intraday resolution is required.
+---------------------
+--- Paragraph 23 ---
+1.2 Data Preprocessing and Cleaning
+---------------------
+--- Paragraph 24 ---
+Raw financial data is inherently noisy and prone to artifacts that can destabilize training.
+---------------------
+--- Paragraph 25 ---
+Survivorship Bias:
+---------------------
+--- Paragraph 26 ---
+A common pitfall is training on the current constituents of an index (e.g., current Nifty 50 or S&P 500 members) over historical periods where the composition was different. This introduces survivorship bias—training only on companies that succeeded, ignoring those that failed. While difficult to eliminate without "point-in-time" databases, the analyst must be aware that backtest results on 2015 data using 2024 constituents will be optimistic.9
+---------------------
+--- Paragraph 27 ---
+Corporate Actions:
+---------------------
+--- Paragraph 28 ---
+Stock splits and dividends artificially alter price levels. yfinance generally provides "Adjusted Close" prices, which retroactively account for these actions. When using external CSVs for the 2015–2023 period, it is imperative to verify if the data is split-adjusted. Training a model on unadjusted data where a stock price drops from $100 to $10 overnight due to a 10-for-1 split will be interpreted by the neural network as a catastrophic crash, corrupting the learned gradients.
+---------------------
+--- Paragraph 29 ---
+Missing Value Imputation:
+---------------------
+--- Paragraph 30 ---
+Financial time series often contain gaps due to holidays or server outages. We employ a "Forward Fill" (ffill) strategy, propagating the last known valid observation forward. This assumes that in the absence of new trade data, the market's valuation of the asset remains unchanged.
+---------------------
+--- Paragraph 33 ---
+$$P_t = \begin{cases} P_{t}^{\text{observed}} & \text{if exists} \\ P_{t-1} & \text{if missing} \end{cases}$$
+---------------------
+--- Paragraph 34 ---
+2. Feature Engineering: The Mathematical Foundation
+---------------------
+--- Paragraph 35 ---
+Deep learning models, while powerful, perform poorly on raw, non-stationary price levels. An asset trading at $100 in 2015 and $2000 in 2023 presents a distribution shift that prevents convergence. We must transform raw prices into stationary, bounded statistical features. We employ a suite of technical indicators that capture Momentum, Volatility, and Trend Strength.
+---------------------
+--- Paragraph 36 ---
+2.1 Technical Indicator Implementation
+---------------------
+--- Paragraph 37 ---
+We define the feature vector $X_t$ at time $t$ as a composite of the following calculated metrics.
+---------------------
+--- Paragraph 38 ---
+2.1.1 Relative Strength Index (RSI)
+---------------------
+--- Paragraph 39 ---
+The RSI is a momentum oscillator that measures the speed and change of price movements, bounded between 0 and 100. It helps the model identify overbought or oversold conditions.
+---------------------
+--- Paragraph 42 ---
+$$\text{RSI} = 100 - \frac{100}{1 + \text{RS}}$$
+---------------------
+--- Paragraph 44 ---
+Where RS is the ratio of the Smoothed Moving Average (SMMA) of gains to the SMMA of losses over a period $N$ (typically 14).
+---------------------
+--- Paragraph 45 ---
+Insight: RSI provides the model with a mean-reverting signal. Extremes (>70 or <30) often precede reversals.10
+---------------------
+--- Paragraph 46 ---
+2.1.2 Moving Average Convergence Divergence (MACD)
+---------------------
+--- Paragraph 47 ---
+MACD is a trend-following momentum indicator. It reveals changes in the strength, direction, momentum, and duration of a trend.
+---------------------
+--- Paragraph 50 ---
+$$\text{MACD Line} = \text{EMA}_{12}(P) - \text{EMA}_{26}(P)$$
+---------------------
+--- Paragraph 52 ---
+$$\text{Signal Line} = \text{EMA}_{9}(\text{MACD Line})$$
+---------------------
+--- Paragraph 54 ---
+The "Histogram" (MACD Line - Signal Line) is a critical feature, representing the derivative of the trend's momentum.
+---------------------
+--- Paragraph 55 ---
+2.1.3 Bollinger Bands
+---------------------
+--- Paragraph 56 ---
+Bollinger Bands consist of a middle band ($N$-period simple moving average) and two outer bands at $K$ standard deviations away.
+---------------------
+--- Paragraph 59 ---
+$$\text{Upper Band} = \text{SMA}_{20} + (2 \times \sigma_{20})$$
+---------------------
+--- Paragraph 61 ---
+$$\text{Lower Band} = \text{SMA}_{20} - (2 \times \sigma_{20})$$
+---------------------
+--- Paragraph 63 ---
+Insight: We engineer a feature called %B, which quantifies where the price is relative to the bands:
+---------------------
+--- Paragraph 66 ---
+$$\%B = \frac{\text{Price} - \text{Lower Band}}{\text{Upper Band} - \text{Lower Band}}$$
+---------------------
+--- Paragraph 68 ---
+This normalizes the price relative to recent volatility, creating a bounded input ideal for LSTM normalization.
+---------------------
+--- Paragraph 69 ---
+2.1.4 Average Directional Index (ADX)
+---------------------
+--- Paragraph 70 ---
+While RSI and MACD imply direction, the ADX specifically measures the strength of the trend, regardless of direction.11 This is crucial for the "Hold" class. A low ADX (<20) indicates a non-trending market where "Hold" is often the correct action to avoid chop.
+---------------------
+--- Paragraph 71 ---
+The calculation involves smoothing the differences between Highs and Lows to derive Positive ($+DI$) and Negative ($-DI$) Directional Indicators.12
+---------------------
+--- Paragraph 73 ---
+$$\text{DX} = \frac{|+DI - -DI|}{|+DI + -DI|} \times 100$$
+---------------------
+--- Paragraph 75 ---
+$$\text{ADX} = \text{SMA}(\text{DX})$$
+---------------------
+--- Paragraph 76 ---
+2.2 Ground Truth Generation: The Labelling Problem
+---------------------
+--- Paragraph 77 ---
+To train a supervised classifier, we must mathematically define what constitutes a "Buy", "Sell", or "Hold" signal. This is the Labelling Logic.
+---------------------
+--- Paragraph 78 ---
+2.2.1 Fixed-Horizon Return Thresholding
+---------------------
+--- Paragraph 79 ---
+We employ a forward-looking return calculation. For a prediction horizon $H$ (e.g., 1 day or 5 bars into the future), we calculate the future return $R_{t+H}$:
+---------------------
+--- Paragraph 82 ---
+$$R_{t+H} = \frac{P_{t+H} - P_t}{P_t}$$
+---------------------
+--- Paragraph 83 ---
+We define symmetric thresholds $\alpha$ (e.g., +0.01 for 1%) and $\beta$ (e.g., -0.01).
+---------------------
+--- Paragraph 84 ---
+Class 1 (Buy): $R_{t+H} > \alpha$. The asset significantly appreciates.
+---------------------
+--- Paragraph 85 ---
+Class 2 (Sell): $R_{t+H} < \beta$. The asset significantly depreciates.
+---------------------
+--- Paragraph 86 ---
+Class 0 (Hold): $\beta \le R_{t+H} \le \alpha$. The price movement is noise.
+---------------------
+--- Paragraph 87 ---
+The Lookahead Bias Imperative:
+---------------------
+--- Paragraph 88 ---
+It is paramount that the labels ($y_t$) are derived from data at $t+1 \dots t+H$, while the features ($X_t$) are derived strictly from data $t$ and prior. Any leakage of $t+1$ data into $X_t$ (e.g., normalizing the entire dataset before splitting) constitutes lookahead bias, rendering the backtest statistically invalid.14
+---------------------
+--- Paragraph 89 ---
+3. Deep Learning Architecture: LSTM Topology
+---------------------
+--- Paragraph 90 ---
+For this task, we select the Long Short-Term Memory (LSTM) network. Financial data is a sequence where the order matters; the market state today is contingent on the trajectory of the past month. LSTMs are specialized RNNs capable of learning long-term dependencies by maintaining an internal cell state, updated via forget, input, and output gates.16
+---------------------
+--- Paragraph 91 ---
+3.1 Data Sequencing and Normalization
+---------------------
+--- Paragraph 92 ---
+Neural networks require inputs to be on a similar scale, typically with mean 0 and variance 1. We use Z-Score Normalization via StandardScaler.
+---------------------
+--- Paragraph 93 ---
+Critical Implementation Detail:
+---------------------
+--- Paragraph 94 ---
+The scaler must be fitted only on the Training Data (2015–2023).
+---------------------
+--- Paragraph 97 ---
+$$\mu_{\text{train}}, \sigma_{\text{train}} = \text{fit}(X_{\text{train}})$$
+---------------------
+--- Paragraph 99 ---
+$$X_{\text{train}}^{\text{norm}} = \frac{X_{\text{train}} - \mu_{\text{train}}}{\sigma_{\text{train}}}$$
+---------------------
+--- Paragraph 101 ---
+This same $\mu_{\text{train}}$ and $\sigma_{\text{train}}$ are then applied to the 2024 Test Data. Fitting the scaler on the combined dataset (2015–2024) allows information from 2024 (e.g., high volatility) to influence the scaling of 2015 data, a subtle form of data leakage.
+---------------------
+--- Paragraph 102 ---
+Sliding Window Sequence Generation:
+---------------------
+--- Paragraph 103 ---
+LSTMs expect 3D tensors of shape (Samples, Time Steps, Features). We utilize a sliding window of length $W$ (e.g., 60 days).
+---------------------
+--- Paragraph 104 ---
+At index $i$, the Input $X_i$ is the matrix of features from $i-60$ to $i$.
+---------------------
+--- Paragraph 105 ---
+The Target $y_i$ is the label associated with time $i$ (predicting $i+H$).
+---------------------
+--- Paragraph 106 ---
+3.2 Network Topology
+---------------------
+--- Paragraph 107 ---
+The architecture is designed to compress feature extraction followed by decision making.
+---------------------
+--- Paragraph 108 ---
+The Softmax activation is critical for multi-class classification, providing a probabilistic confidence score for each action.
+---------------------
+--- Paragraph 109 ---
+4. Fault-Tolerant Training: The "Crash-Proof" Framework
+---------------------
+--- Paragraph 110 ---
+Training deep learning models on nearly a decade of data is computationally intensive. A single run may take hours or days depending on hardware. The user explicitly requires a mechanism to "resume training from checkpoints" in the event of a crash. This requires a shift from a linear script to a state-aware execution loop.
+---------------------
+--- Paragraph 111 ---
+4.1 The Mechanics of Checkpointing
+---------------------
+--- Paragraph 112 ---
+Checkpointing in TensorFlow/Keras involves serializing the model's state to disk at specific intervals (usually every epoch). A robust checkpoint must preserve four distinct elements:
+---------------------
+--- Paragraph 113 ---
+Model Architecture: The definition of layers and connections.
+---------------------
+--- Paragraph 114 ---
+Model Weights: The learned parameters (matrices) of the layers.
+---------------------
+--- Paragraph 115 ---
+Training Configuration: The loss function, optimizer type, and compiled metrics.
+---------------------
+--- Paragraph 116 ---
+Optimizer State: This is the most critical and often overlooked component for correct resumption. Advanced optimizers like Adam or RMSprop maintain internal state variables (moving averages of gradients, momentum).
+---------------------
+--- Paragraph 117 ---
+The Risk of Improper Resumption:
+---------------------
+--- Paragraph 118 ---
+If one loads only the model weights but not the optimizer state, the optimizer treats the resumed epoch as the "first" step of training. It resets its momentum vectors to zero. This can cause a sudden spike in loss or divergent behavior, effectively wasting the prior training effort. Therefore, we must use save_weights_only=False to save the full model state.17
+---------------------
+--- Paragraph 119 ---
+4.2 Implementation: The ModelCheckpoint Callback
+---------------------
+--- Paragraph 120 ---
+We utilize the tf.keras.callbacks.ModelCheckpoint callback.
+---------------------
+--- Paragraph 121 ---
+File Format: We use the modern .keras format (or .h5), which supports full-state serialization.
+---------------------
+--- Paragraph 122 ---
+Filename Templating: We embed the epoch number in the filename: model_epoch_{epoch:02d}.keras. This allows the resumption logic to identify exactly when the crash occurred.
+---------------------
+--- Paragraph 123 ---
+Configuration:
+---------------------
+--- Paragraph 124 ---
+monitor='val_loss': We track validation loss.
+---------------------
+--- Paragraph 125 ---
+save_best_only=False: For crash recovery, we need the latest state, regardless of whether it is the "best" statistical model. Saving every epoch allows us to resume from the exact point of failure.19
+---------------------
+--- Paragraph 126 ---
+4.3 The Resumption Logic Algorithm
+---------------------
+--- Paragraph 127 ---
+To achieve "full proof" resilience, the script must perform the following logic sequence at startup:
+---------------------
+--- Paragraph 128 ---
+Scan Directory: Inspect the designated checkpoint folder.
+---------------------
+--- Paragraph 129 ---
+Identify Latest: Parse filenames to find the file with the highest epoch number.
+---------------------
+--- Paragraph 130 ---
+Conditional Loading:
+---------------------
+--- Paragraph 131 ---
+Case A (No Checkpoint): Instantiate a fresh model. Compile it. Set initial_epoch = 0.
+---------------------
+--- Paragraph 132 ---
+Case B (Checkpoint Exists): Load the model using tf.keras.models.load_model. This restores architecture, weights, and optimizer state. Parse the filename to set initial_epoch to the saved epoch count.
+---------------------
+--- Paragraph 133 ---
+Execute Fit: Call model.fit() passing the initial_epoch parameter. Keras uses this parameter to adjust internal counters and learning rate schedules.21
+---------------------
+--- Paragraph 134 ---
+This logic guarantees that if the process terminates at Epoch 45 of 100, the next execution will seamlessly begin at Epoch 46.
+---------------------
+--- Paragraph 135 ---
+5. Comprehensive Code Implementation
+---------------------
+--- Paragraph 136 ---
+Below is the complete, integrated Python code implementing the architecture described. It includes data generation (simulated for reproducibility in this report context, but structured to accept real CSVs), feature engineering, robust checkpointing, and validation.
+---------------------
+--- Paragraph 137 ---
+5.1 Step 1: Dependencies and Configuration
+---------------------
+--- Paragraph 139 ---
+Python
+---------------------
+--- Paragraph 142 ---
+import os
+import glob
+import numpy as np
+import pandas as pd
+import yfinance as yf
+import tensorflow as tf
+from sklearn.preprocessing import StandardScaler
+from tensorflow.keras.models import Sequential, load_model
+from tensorflow.keras.layers import LSTM, Dense, Dropout
+from tensorflow.keras.callbacks import ModelCheckpoint
+from sklearn.metrics import confusion_matrix, classification_report, accuracy_score
+
+# --- Configuration Constants ---
+TICKER = "AAPL"          # Target Asset
+START_TRAIN = "2015-01-01"
+END_TRAIN = "2023-12-31"
+START_TEST = "2024-01-01"
+END_TEST = "2024-12-31"  # Or current date
+SEQ_LEN = 60             # Lookback window (e.g., 60 days)
+PREDICT_HORIZON = 1      # Predict label for 1 step ahead
+CHECKPOINT_DIR = "./training_checkpoints"
+os.makedirs(CHECKPOINT_DIR, exist_ok=True)
+
+---------------------
+--- Paragraph 143 ---
+5.2 Step 2: Data Acquisition and Feature Engineering
+---------------------
+--- Paragraph 144 ---
+This block handles the hybrid data requirement.
+---------------------
+--- Paragraph 146 ---
+Python
+---------------------
+--- Paragraph 149 ---
+def get_data(ticker, start, end):
+    """
+    Wrapper to fetch data. In a production environment for 2015-2023 intraday data,
+    this function would load from local CSVs (e.g., Kaggle datasets) rather than yfinance.
+    For this demonstration, we use yfinance daily data which is available for the full range.
+    """
+    print(f"Fetching data for {ticker} from {start} to {end}...")
+    # : yfinance download
+    df = yf.download(ticker, start=start, end=end)
+    if df.empty:
+        raise ValueError("No data fetched. Check ticker or internet connection.")
+    return df
+
+def add_technical_indicators(df):
+    """
+    Computes RSI, MACD, and Bollinger Bands to create stationary features.
+    """
+    # Ensure we are working with a copy to avoid SettingWithCopy warnings
+    df = df.copy()
+    
+    # 1. RSI (14 periods)
+    delta = df['Close'].diff()
+    gain = (delta.where(delta > 0, 0)).rolling(window=14).mean()
+    loss = (-delta.where(delta < 0, 0)).rolling(window=14).mean()
+    rs = gain / loss
+    df = 100 - (100 / (1 + rs))
+    
+    # 2. MACD
+    ema12 = df['Close'].ewm(span=12, adjust=False).mean()
+    ema26 = df['Close'].ewm(span=26, adjust=False).mean()
+    df = ema12 - ema26
+    df = df.ewm(span=9, adjust=False).mean()
+    
+    # 3. Bollinger Bands
+    df = df['Close'].rolling(window=20).mean()
+    df = df['Close'].rolling(window=20).std()
+    df['Upper'] = df + (df * 2)
+    df['Lower'] = df - (df * 2)
+    # %B Feature: Normalized price position within bands
+    df = (df['Close'] - df['Lower']) / (df['Upper'] - df['Lower'])
+    
+    # Drop NaN values generated by rolling windows
+    df.dropna(inplace=True)
+    return df
+
+def create_labels(df, horizon=1, threshold=0.01):
+    """
+    Generates labels based on future returns.
+    0: Hold, 1: Buy, 2: Sell
+    """
+    # Calculate future return (Lookahead)
+    df = df['Close'].shift(-horizon) / df['Close'] - 1
+    
+    conditions = > threshold),  # Buy
+        (df < -threshold)  # Sell
+    ]
+    choices = 
+    # Default is 0 (Hold)
+    df['Label'] = np.select(conditions, choices, default=0)
+    
+    # Drop the last 'horizon' rows as they have no future return
+    df.dropna(subset=, inplace=True)
+    return df
+
+# Execution
+full_data = get_data(TICKER, START_TRAIN, END_TEST)
+processed_data = add_technical_indicators(full_data)
+labeled_data = create_labels(processed_data)
+
+# Split into Train (2015-2023) and Test (2024)
+train_df = labeled_data.loc.copy()
+test_df = labeled_data.loc.copy()
+
+print(f"Training Set Size: {len(train_df)}")
+print(f"Testing Set Size: {len(test_df)}")
+
+---------------------
+--- Paragraph 150 ---
+5.3 Step 3: Sequencing and Normalization
+---------------------
+--- Paragraph 152 ---
+Python
+---------------------
+--- Paragraph 155 ---
+# Feature Columns
+feature_cols =
+
+# : Normalization fit ONLY on training data
+scaler = StandardScaler()
+train_features = scaler.fit_transform(train_df[feature_cols])
+test_features = scaler.transform(test_df[feature_cols])
+
+def create_sequences(features, labels, seq_len):
+    X, y =,
+    for i in range(seq_len, len(features)):
+        X.append(features[i-seq_len:i])
+        y.append(labels[i])
+    return np.array(X), np.array(y)
+
+# Create 3D Tensors
+X_train, y_train = create_sequences(train_features, train_df['Label'].values, SEQ_LEN)
+X_test, y_test = create_sequences(test_features, test_df['Label'].values, SEQ_LEN)
+
+# One-Hot Encode Targets
+y_train_encoded = tf.keras.utils.to_categorical(y_train, num_classes=3)
+y_test_encoded = tf.keras.utils.to_categorical(y_test, num_classes=3)
+
+---------------------
+--- Paragraph 156 ---
+5.4 Step 4: The Crash-Proof Training Loop
+---------------------
+--- Paragraph 157 ---
+This section implements the exact checkpointing requirements.
+---------------------
+--- Paragraph 159 ---
+Python
+---------------------
+--- Paragraph 162 ---
+def build_lstm_model(input_shape):
+    model = Sequential()
+    model.compile(optimizer='adam', 
+                  loss='categorical_crossentropy', 
+                  metrics=['accuracy'])
+    return model
+
+# [19]: Checkpoint Callback Configuration
+checkpoint_path = os.path.join(CHECKPOINT_DIR, "model_epoch_{epoch:02d}.keras")
+checkpoint_cb = ModelCheckpoint[23]
+
+# [20, 21]: Resumption Logic
+initial_epoch = 0
+model = None
+
+# Scan for existing checkpoints
+existing_checkpoints = glob.glob(os.path.join(CHECKPOINT_DIR, "model_epoch_*.keras"))
+
+if existing_checkpoints:
+    # Find the latest file based on epoch number in filename
+    # Assumes format "model_epoch_XX.keras"
+    latest_file = max(existing_checkpoints, key=lambda f: int(f.split('_')[-1].split('.')))
+    print(f"Resuming training from checkpoint: {latest_file}")
+    
+    # Load model state
+    model = load_model(latest_file)
+    
+    # Extract epoch number
+    initial_epoch = int(latest_file.split('_')[-1].split('.'))
+else:
+    print("No checkpoints found. Starting fresh training.")
+    model = build_lstm_model((SEQ_LEN, len(feature_cols)))
+
+# Execute Training
+history = model.fit(
+    X_train, y_train_encoded,
+    epochs=50,                  # Total epochs target
+    batch_size=64,
+    validation_split=0.1,
+    callbacks=[checkpoint_cb],
+    initial_epoch=initial_epoch # : Resume internal counters
+)
+
+---------------------
+--- Paragraph 163 ---
+6. Validation and Testing: The 2024 Application
+---------------------
+--- Paragraph 164 ---
+The final phase addresses the user's requirement to "apply it on 2024 data, check how many buy/sell/hold options come and test it with real 2024 data."
+---------------------
+--- Paragraph 165 ---
+6.1 Generating and Counting Signals
+---------------------
+--- Paragraph 166 ---
+We perform inference on the 2024 test set. The model outputs probabilities (e.g., [0.1, 0.8, 0.1]). We use np.argmax to convert these into discrete classes.
+---------------------
+--- Paragraph 168 ---
+Python
+---------------------
+--- Paragraph 171 ---
+# 1. Generate Predictions
+print("Generating predictions for 2024 data...")
+predictions_prob = model.predict(X_test)
+predictions_classes = np.argmax(predictions_prob, axis=1)
+true_classes = np.argmax(y_test_encoded, axis=1)
+
+# 2. Count Signals (Buy/Sell/Hold)
+unique, counts = np.unique(predictions_classes, return_counts=True)
+signal_counts = dict(zip(unique, counts))
+
+# Map back to names for readability
+label_map = {0: 'Hold', 1: 'Buy', 2: 'Sell'}
+readable_counts = {label_map[k]: v for k, v in signal_counts.items()}
+
+print("\n--- 2024 Signal Generation Report ---")
+print(f"Total Trading Opportunities Analyzed: {len(predictions_classes)}")
+print(f"Signal Distribution: {readable_counts}")
+
+---------------------
+--- Paragraph 172 ---
+6.2 Determining "Correctness"
+---------------------
+--- Paragraph 173 ---
+To quantify how many signals were "correct," we compare the predicted class against the label derived from the actual 2024 price movements. We use three key tools:
+---------------------
+--- Paragraph 174 ---
+Confusion Matrix: A tabular breakdown of correct vs. incorrect predictions for each class.
+---------------------
+--- Paragraph 175 ---
+Accuracy Score: The raw percentage of matches.
+---------------------
+--- Paragraph 176 ---
+Classification Report: Precision and Recall metrics.
+---------------------
+--- Paragraph 178 ---
+Python
+---------------------
+--- Paragraph 181 ---
+# 3. Validation Metrics
+acc = accuracy_score(true_classes, predictions_classes)
+conf_matrix = confusion_matrix(true_classes, predictions_classes)
+class_report = classification_report(true_classes, predictions_classes, target_names=)
+
+print(f"\nOverall Model Accuracy on 2024 Data: {acc:.2%}")
+print("\n--- Detailed Classification Report ---")
+print(class_report)
+
+print("\n--- Confusion Matrix ---")
+# Rows = True Classes, Columns = Predicted Classes
+print(pd.DataFrame(conf_matrix, 
+                   index=, 
+                   columns=))
+
+---------------------
+--- Paragraph 182 ---
+6.3 Interpreting the Output
+---------------------
+--- Paragraph 183 ---
+The Confusion Matrix provides the direct answer to "how many are correct":
+---------------------
+--- Paragraph 184 ---
+True Positives (Diagonal):
+---------------------
+--- Paragraph 185 ---
+Hold Correct: The number of times the model said "Hold" and the market indeed ranged or chopped.
+---------------------
+--- Paragraph 186 ---
+Buy Correct: The number of times the model said "Buy" and the price actually rose > 1%.
+---------------------
+--- Paragraph 187 ---
+Sell Correct: The number of times the model said "Sell" and the price actually fell > 1%.
+---------------------
+--- Paragraph 188 ---
+Costly Errors (Off-Diagonal):
+---------------------
+--- Paragraph 189 ---
+False Positives (Type I Error): Model predicts "Buy" (1), but the market Holds (0) or Sells (2). This leads to losing trades or unnecessary transaction costs.
+---------------------
+--- Paragraph 190 ---
+False Negatives (Type II Error): Model predicts "Hold" (0) when a massive rally (Buy) occurred. This represents missed opportunity cost.
+---------------------
+--- Paragraph 191 ---
+Directional Accuracy:
+---------------------
+--- Paragraph 192 ---
+For a simplified view of active trading performance, we often calculate:
+---------------------
+--- Paragraph 195 ---
+$$\text{Directional Accuracy} = \frac{\text{Correct Buys} + \text{Correct Sells}}{\text{Total Buy Signals} + \text{Total Sell Signals}}$$
+---------------------
+--- Paragraph 197 ---
+This metric filters out the "Hold" noise to determine if the model is trustworthy when it explicitly recommends entering the market.16
+---------------------
+--- Paragraph 198 ---
+7. Conclusions and Operational Recommendations
+---------------------
+--- Paragraph 199 ---
+7.1 Data Integrity and Survivorship
+---------------------
+--- Paragraph 200 ---
+While yfinance facilitates accessible data ingestion, the user must remain vigilant regarding Survivorship Bias when backtesting over the 2015–2023 period. Relying solely on the current list of S&P 500 or Nifty 50 companies to fetch historical data implicitly excludes companies that went bankrupt or were delisted during the training period. This skews the model towards overly optimistic trend-following behavior. For production systems, utilizing "delisted" datasets from providers like Polygon.io or Kaggle is a necessary mitigation step.8
+---------------------
+--- Paragraph 201 ---
+7.2 The Necessity of Regime Adaptation
+---------------------
+--- Paragraph 202 ---
+Financial markets are non-stationary systems. A model trained on the low-volatility bull market of 2015–2019 may struggle to generalize to the high-volatility, inflation-driven regimes of 2023–2024. The Walk-Forward Validation approach—where the model is periodically re-trained on a rolling window of the most recent data—is highly recommended. The checkpointing architecture detailed in Section 4 is perfectly suited for this, allowing for incremental learning (fine-tuning) on new data without retraining from scratch.
+---------------------
+--- Paragraph 203 ---
+7.3 Execution Realities
+---------------------
+--- Paragraph 204 ---
+The "Correctness" metrics derived in Section 6.2 represent theoretical alpha. Real-world execution involves slippage (the difference between the signal price and execution price) and commissions. A high-accuracy model may still be unprofitable if the average profit per trade is lower than the transaction costs. Therefore, the next logical step in this pipeline is to feed the generated signals into an event-driven backtesting engine (e.g., Backtrader or VectorBT) to generate an equity curve, which provides the ultimate validation of the trading strategy.9
+---------------------
+--- Paragraph 205 ---
+This report provides a comprehensive, fault-tolerant framework for developing deep learning trading systems. By integrating robust data handling, statistically sound feature engineering, and a crash-proof training loop, it lays a professional foundation for quantitative market analysis.
+---------------------
+--- Paragraph 206 ---
+Works cited
+---------------------
+--- Paragraph 207 ---
+Day 4: Fetching Historical Stock Data with yfinance | by A V - Medium, accessed on January 20, 2026, https://medium.com/@anjalivemuri97/day-4-fetching-historical-stock-data-with-yfinance-f45f3bd8b9c6
+---------------------
+--- Paragraph 208 ---
+Yahoo Historical Data Download - User Guide - Excel Price Feed, accessed on January 20, 2026, https://www.excelpricefeed.com/userguide/historic-data-download-yahoo
+---------------------
+--- Paragraph 209 ---
+yfinance Library - A Complete Guide - AlgoTrading101 Blog, accessed on January 20, 2026, https://algotrading101.com/learn/yfinance-guide/
+---------------------
+--- Paragraph 210 ---
+Can not download 6 months TSLA with interval of 1 minute in yfinance - Stack Overflow, accessed on January 20, 2026, https://stackoverflow.com/questions/76605981/can-not-download-6-months-tsla-with-interval-of-1-minute-in-yfinance
+---------------------
+--- Paragraph 211 ---
+fix - "period=max" returns "failed download" · Issue #919 · ranaroussi/yfinance - GitHub, accessed on January 20, 2026, https://github.com/ranaroussi/yfinance/issues/919
+---------------------
+--- Paragraph 212 ---
+NSE - Nifty 50 Index Minute data (2015 to 2025) - Kaggle, accessed on January 20, 2026, https://www.kaggle.com/datasets/debashis74017/nifty-50-minute-data
+---------------------
+--- Paragraph 213 ---
+yfinance Library – A Complete Guide | IBKR Quant, accessed on January 20, 2026, https://www.interactivebrokers.com/campus/ibkr-quant-news/yfinance-library-a-complete-guide/
+---------------------
+--- Paragraph 214 ---
+Why yfinance Keeps Getting Blocked, and What to Use Instead | by Trading Dude - Medium, accessed on January 20, 2026, https://medium.com/@trading.dude/why-yfinance-keeps-getting-blocked-and-what-to-use-instead-92d84bb2cc01
+---------------------
+--- Paragraph 215 ---
+Mastering Python Backtesting for Trading Strategies | by Time Money Code | Medium, accessed on January 20, 2026, https://medium.com/@timemoneycode/mastering-python-backtesting-for-trading-strategies-1f7df773fdf5
+---------------------
+--- Paragraph 216 ---
+How to Build a Backtesting Engine in Python - LuxAlgo, accessed on January 20, 2026, https://www.luxalgo.com/blog/how-to-build-a-backtesting-engine-in-python/
+---------------------
+--- Paragraph 217 ---
+Algorithmic Trading with Average Directional Index in Python - EODHD, accessed on January 20, 2026, https://eodhd.com/financial-academy/backtesting-strategies-examples/algorithmic-trading-with-average-directional-index-in-python
+---------------------
+--- Paragraph 218 ---
+Mathematical Intuition of the ADX Indicator: A Python Approach - QuantInsti Blog, accessed on January 20, 2026, https://blog.quantinsti.com/adx-indicator-python/
+---------------------
+--- Paragraph 219 ---
+Algorithmic Trading with ADX in Python | by EODHD APIs - Medium, accessed on January 20, 2026, https://eodhd.medium.com/algorithmic-trading-with-the-average-directional-index-in-python-6f3b2ce08e75
+---------------------
+--- Paragraph 220 ---
+Look-ahead bias is a hell of a drug! : r/algotrading - Reddit, accessed on January 20, 2026, https://www.reddit.com/r/algotrading/comments/1n8rn14/lookahead_bias_is_a_hell_of_a_drug/
+---------------------
+--- Paragraph 221 ---
+How I Built an Event-Driven Backtesting Engine in Python | by Timothy Kimutai | Medium, accessed on January 20, 2026, https://timkimutai.medium.com/how-i-built-an-event-driven-backtesting-engine-in-python-25179a80cde0
+---------------------
+--- Paragraph 222 ---
+LSTM-Based Forex Trading Bot Using Python and MetaTrader 5: Design, Simulation, and Evaluation - ResearchGate, accessed on January 20, 2026, https://www.researchgate.net/publication/395587759_LSTM-Based_Forex_Trading_Bot_Using_Python_and_MetaTrader_5_Design_Simulation_and_Evaluation
+---------------------
+--- Paragraph 223 ---
+Save and load weights in keras - python - Stack Overflow, accessed on January 20, 2026, https://stackoverflow.com/questions/47266383/save-and-load-weights-in-keras
+---------------------
+--- Paragraph 224 ---
+Difference between load and load_weights in keras : r/tensorflow - Reddit, accessed on January 20, 2026, https://www.reddit.com/r/tensorflow/comments/iloxjl/difference_between_load_and_load_weights_in_keras/
+---------------------
+--- Paragraph 225 ---
+Checkpointing in TensorFlow - DigitalOcean, accessed on January 20, 2026, https://www.digitalocean.com/community/tutorials/checkpointing-in-tensorflow
+---------------------
+--- Paragraph 226 ---
+TensorFlow 2.0 Tutorial 03: Saving Checkpoints - Lambda, accessed on January 20, 2026, https://lambda.ai/blog/tensorflow-2-0-tutorial-03-saving-checkpoints
+---------------------
+--- Paragraph 227 ---
+What does initial_epoch in Keras mean? - Stack Overflow, accessed on January 20, 2026, https://stackoverflow.com/questions/52476191/what-does-initial-epoch-in-keras-mean
+---------------------
+--- Paragraph 228 ---
+Backtrader for Backtesting (Python) - A Complete Guide - AlgoTrading101 Blog, accessed on January 20, 2026, https://algotrading101.com/learn/backtrader-for-backtesting/
+---------------------
